@@ -29,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import torch
 import torch.nn as nn
+import numpy as np
 from torch.utils.data import DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
@@ -66,6 +67,14 @@ def parse_args():
     p.add_argument("--num-workers", type=int, default=0,
                    help="DataLoader workers. Keep 0 on Windows.")
     p.add_argument("--grad-clip", type=float, default=1.0)
+    p.add_argument(
+        "--class-weights",
+        choices=["none", "inverse", "inverse_sqrt"],
+        default="none",
+        help="Per-class weighting in CrossEntropyLoss. "
+             "'inverse' uses 1/freq (strongest), 'inverse_sqrt' uses 1/sqrt(freq) (milder), "
+             "'none' uses unweighted loss (default).",
+    )
 
     # Device / seed
     p.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
@@ -213,7 +222,34 @@ def main():
     _, total_params = count_parameters(model)
     print(f"[INFO] Model: {args.encoder} U-Net | params: {human_readable(total_params)}")
 
-    criterion = nn.CrossEntropyLoss()
+    # Optionally compute per-class weights from the training-set pixel frequencies
+    if args.class_weights != "none":
+        print(f"[INFO] Computing per-class weights ({args.class_weights}) from train masks ...")
+        # Use the underlying dataset (not the Subset wrapper) for the full-frequency pass
+        base_train_ds = train_ds.dataset if isinstance(train_ds, Subset) else train_ds
+        # Use the dataset's helper that scans all masks; values returned as percent of total
+        dist = base_train_ds.get_class_distribution()
+        # dist is {class_name: frequency_in_[0,1]}
+        # build weight tensor in class-id order (0..num_classes-1)
+        freqs = np.array(
+            [dist.get(VDD_CLASSES[i], 1e-9) for i in range(args.num_classes)],
+            dtype=np.float64,
+        )
+        freqs = np.clip(freqs, 1e-9, None)  # avoid div-by-zero
+        if args.class_weights == "inverse":
+            weights = 1.0 / freqs
+        else:  # inverse_sqrt
+            weights = 1.0 / np.sqrt(freqs)
+        # normalize so the mean is ~1 (keeps loss magnitude comparable to unweighted)
+        weights = weights / weights.mean()
+        print(f"[INFO] Class frequencies (%): "
+              + ", ".join(f"{VDD_CLASSES[i]}={freqs[i]*100:.3f}" for i in range(args.num_classes)))
+        print(f"[INFO] Class weights         : "
+              + ", ".join(f"{VDD_CLASSES[i]}={weights[i]:.2f}" for i in range(args.num_classes)))
+        weight_tensor = torch.tensor(weights, dtype=torch.float32, device=device)
+        criterion = nn.CrossEntropyLoss(weight=weight_tensor)
+    else:
+        criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
                                   weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
