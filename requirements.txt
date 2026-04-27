@@ -1,0 +1,49 @@
+# --- Core deep learning (CPU build for local dev on Intel Arc laptop) ---
+# Install torch/torchvision separately with:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+torch>=2.2.0
+torchvision>=0.17.0
+
+# --- Segmentation models ---
+segmentation-models-pytorch>=0.3.3
+timm>=0.9.12
+
+# --- Data augmentation & image processing ---
+albumentations>=1.4.0
+opencv-python>=4.9.0
+Pillow>=10.2.0
+
+# --- Metrics ---
+torchmetrics>=1.3.0
+scikit-learn>=1.4.0
+
+# --- Numerical / data ---
+numpy>=1.26.0
+pandas>=2.2.0
+scipy>=1.12.0
+
+# --- Visualization ---
+matplotlib>=3.8.0
+seaborn>=0.13.0
+
+# --- Experiment tracking (choose one; wandb recommended) ---
+tensorboard>=2.16.0
+# wandb>=0.16.0
+
+# --- Utilities ---
+tqdm>=4.66.0
+pyyaml>=6.0.1
+hydra-core>=1.3.2     # optional, for config management
+einops>=0.7.0
+
+# --- Notebook / dev ---
+jupyter>=1.0.0
+ipykernel>=6.29.0
+
+# --- For FID / LPIPS (GAN evaluation) ---
+torch-fidelity>=0.3.0
+lpips>=0.1.4
+
+# --- Dataset download helpers ---
+huggingface_hub>=0.20.0
+kaggle>=1.6.0
