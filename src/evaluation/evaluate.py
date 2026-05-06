@@ -1,14 +1,18 @@
 """Evaluate a trained checkpoint on a chosen split (val/test) of VDD.
 
-Saves results as a JSON next to the checkpoint, plus prints them.
+Saves results both as a JSON and as TensorBoard scalars (so the test/val curves
+appear in the same TB dashboard as the training run).
 
 Usage:
-    python src/evaluation/evaluate.py \\
-        --checkpoint outputs/runs/unet_resnet34_clean_v2_weighted/best.pth \\
-        --data-root data/raw/VDD/VDD \\
-        --split test \\
-        --image-size 768 \\
+    python src/evaluation/evaluate.py \
+        --checkpoint outputs/runs/unet_resnet34_clean_v2_weighted/best.pth \
+        --data-root data/raw/VDD/VDD \
+        --split test \
+        --image-size 768 \
         --batch-size 4
+
+By default, TB events are written into the same `tb/` directory used during
+training, so curves merge cleanly. Pass `--no-tb` to disable TB logging.
 """
 import argparse
 import json
@@ -22,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from src.datasets.vdd import VDDDataset, VDD_CLASSES
@@ -45,6 +50,10 @@ def parse_args():
     p.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     p.add_argument("--output", default=None,
                    help="Where to save JSON results. Default: <ckpt_dir>/<split>_results.json")
+    p.add_argument("--tb-dir", default=None,
+                   help="TensorBoard log dir. Default: <ckpt_dir>/tb (merges with training logs)")
+    p.add_argument("--no-tb", action="store_true",
+                   help="Disable TensorBoard logging.")
     return p.parse_args()
 
 
@@ -68,7 +77,8 @@ def main():
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
     print(f"[INFO] Loading checkpoint: {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    print(f"[INFO] Checkpoint epoch={ckpt.get('epoch', '?')}, "
+    ckpt_epoch = ckpt.get("epoch", 0)
+    print(f"[INFO] Checkpoint epoch={ckpt_epoch}, "
           f"val_mIoU={ckpt.get('mIoU', '?')}")
 
     # --- Model ---
@@ -117,6 +127,7 @@ def main():
     results["num_samples"] = len(ds)
     results["image_size"] = args.image_size
     results["checkpoint"] = str(ckpt_path)
+    results["checkpoint_epoch"] = ckpt_epoch
     results["eval_time_s"] = elapsed
 
     # --- Print ---
@@ -135,7 +146,7 @@ def main():
         bar = "#" * int(iou * 40)
         print(f"  {cls:14s} {iou:.4f}  {bar}")
 
-    # --- Save ---
+    # --- Save JSON ---
     if args.output is None:
         args.output = ckpt_path.parent / f"{args.split}_results.json"
     out_path = Path(args.output)
@@ -143,6 +154,27 @@ def main():
     with open(out_path, "w") as f:
         json.dump(results, f, indent=2)
     print(f"\n[OK] Saved results to: {out_path}")
+
+    # --- Write TensorBoard scalars ---
+    if not args.no_tb:
+        tb_dir = args.tb_dir or str(ckpt_path.parent / "tb")
+        Path(tb_dir).mkdir(parents=True, exist_ok=True)
+        writer = SummaryWriter(log_dir=tb_dir)
+        # Use the checkpoint's epoch as the X axis: this puts the test/val point
+        # at the same epoch where the model was selected, so the dot in TB lines
+        # up with the val curve from training.
+        step = int(ckpt_epoch) if ckpt_epoch else 0
+        prefix = args.split  # 'test', 'val', etc.
+        writer.add_scalar(f"{prefix}/mIoU",     results["mIoU"],     step)
+        writer.add_scalar(f"{prefix}/F1",       results["F1"],       step)
+        writer.add_scalar(f"{prefix}/accuracy", results["accuracy"], step)
+        writer.add_scalar(f"{prefix}/loss",     results["loss"],     step)
+        for cls, iou in results["per_class_iou"].items():
+            writer.add_scalar(f"{prefix}/iou_{cls}", iou, step)
+        writer.flush()
+        writer.close()
+        print(f"[OK] TensorBoard scalars written to: {tb_dir}")
+        print(f"     (group '{prefix}/*' at step={step})")
 
 
 if __name__ == "__main__":
