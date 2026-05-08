@@ -1,22 +1,27 @@
-"""Train a U-Net on VDD for semantic segmentation.
+"""Train a U-Net for semantic segmentation on VDD.
 
-Logs everything to TensorBoard and saves:
-    outputs/runs/<run_name>/
-        ├── config.json       parameters used for this run
-        ├── best.pth          model weights with best val mIoU
-        ├── last.pth          model weights at the end of training
-        ├── history.json      per-epoch metrics (for plots in the report)
-        └── tb/               TensorBoard event files
+Phase 5 update: now supports multiple training data roots via --data-roots,
+which makes it possible to train on a mix of clean and foggy VDD variants.
+The validation root is still a single one (--data-root, used for selecting the
+best checkpoint).
 
-Usage:
-    # Real training (needs GPU in practice):
-    python src/training/train_unet.py --epochs 30 --batch-size 8
+Examples:
+    # Phase 1 baseline (clean only)
+    python src/training/train_unet.py \\
+        --data-root data/raw/VDD/VDD \\
+        --run-name unet_resnet34_clean_v2_weighted \\
+        --image-size 768 --epochs 30 --batch-size 4 \\
+        --class-weights inverse_sqrt
 
-    # Smoke test on CPU (2 epochs, 20 images):
-    python src/training/train_unet.py --epochs 2 --subset 20 --batch-size 2
-
-    # Launch TensorBoard (separate terminal):
-    tensorboard --logdir outputs/runs
+    # Phase 5 mixed training: clean + foggy_medium_768 + foggy_dense_768
+    python src/training/train_unet.py \\
+        --data-root data/raw/VDD/VDD \\
+        --data-roots data/raw/VDD/VDD \\
+                     data/processed/VDD_foggy_medium_768 \\
+                     data/processed/VDD_foggy_dense_768 \\
+        --run-name unet_resnet34_mixed_v3 \\
+        --image-size 768 --epochs 30 --batch-size 4 \\
+        --class-weights inverse_sqrt
 """
 import argparse
 import json
@@ -24,13 +29,12 @@ import sys
 import time
 from pathlib import Path
 
-# Allow src.* imports when running as a script
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+import numpy as np
 import torch
 import torch.nn as nn
-import numpy as np
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import ConcatDataset, DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
@@ -40,23 +44,32 @@ from src.models.unet import build_unet, count_parameters, human_readable
 from src.utils.transforms import get_eval_transform, get_train_transform
 
 
-# ------------------------------------------------------------------ CLI
-
-
 def parse_args():
     p = argparse.ArgumentParser()
 
     # Data
-    p.add_argument("--data-root", default="data/raw/VDD/VDD")
+    p.add_argument(
+        "--data-root",
+        default="data/raw/VDD/VDD",
+        help="Root used for VALIDATION (single split). The training data is "
+             "either this same root (default) or the list passed to --data-roots.",
+    )
+    p.add_argument(
+        "--data-roots",
+        nargs="+",
+        default=None,
+        help="One or more roots used for TRAINING. If given, the training "
+             "dataset is the concatenation of the train splits of each root. "
+             "If omitted, training uses --data-root only.",
+    )
     p.add_argument("--image-size", type=int, default=512)
     p.add_argument("--subset", type=int, default=0,
-                   help="If >0, use only first N samples of train AND val (smoke test)")
+                   help="If >0, use only first N samples from each root (smoke test)")
 
     # Model
     p.add_argument("--encoder", default="resnet34")
     p.add_argument("--num-classes", type=int, default=7)
-    p.add_argument("--no-pretrained", action="store_true",
-                   help="Train from scratch instead of ImageNet weights")
+    p.add_argument("--no-pretrained", action="store_true")
 
     # Training
     p.add_argument("--epochs", type=int, default=30)
@@ -64,16 +77,13 @@ def parse_args():
     p.add_argument("--val-batch-size", type=int, default=4)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight-decay", type=float, default=1e-4)
-    p.add_argument("--num-workers", type=int, default=0,
-                   help="DataLoader workers. Keep 0 on Windows.")
+    p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument(
         "--class-weights",
         choices=["none", "inverse", "inverse_sqrt"],
         default="none",
-        help="Per-class weighting in CrossEntropyLoss. "
-             "'inverse' uses 1/freq (strongest), 'inverse_sqrt' uses 1/sqrt(freq) (milder), "
-             "'none' uses unweighted loss (default).",
+        help="Per-class weighting in CrossEntropyLoss.",
     )
 
     # Device / seed
@@ -83,8 +93,7 @@ def parse_args():
     # I/O
     p.add_argument("--output-dir", default="outputs/runs")
     p.add_argument("--run-name", default=None)
-    p.add_argument("--log-every", type=int, default=10,
-                   help="Log batch-level loss to TB every N batches")
+    p.add_argument("--log-every", type=int, default=10)
 
     return p.parse_args()
 
@@ -94,16 +103,27 @@ def pick_device(choice: str) -> torch.device:
         return torch.device("cpu")
     if choice == "cuda":
         if not torch.cuda.is_available():
-            raise RuntimeError("CUDA requested but not available")
+            raise RuntimeError("CUDA not available")
         return torch.device("cuda")
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-# ------------------------------------------------------------ train / val loops
+def build_train_dataset(data_roots, image_size, subset, transform):
+    """Build a (possibly concatenated) training dataset from one or more VDD-shaped roots."""
+    individual = []
+    for root in data_roots:
+        ds = VDDDataset(root, "train", transform=transform)
+        if subset > 0:
+            k = min(subset, len(ds))
+            ds = Subset(ds, list(range(k)))
+        print(f"[INFO]   train root: {root}  ->  {len(ds)} samples")
+        individual.append(ds)
+    if len(individual) == 1:
+        return individual[0]
+    return ConcatDataset(individual)
 
 
-def train_one_epoch(model, loader, optimizer, criterion, device, writer,
-                    epoch: int, args):
+def train_one_epoch(model, loader, optimizer, criterion, device, writer, epoch, args):
     model.train()
     total_loss = 0.0
     n_batches = 0
@@ -122,11 +142,11 @@ def train_one_epoch(model, loader, optimizer, criterion, device, writer,
 
         total_loss += loss.item()
         n_batches += 1
+        pbar.set_postfix(loss=f"{loss.item():.4f}")
 
         if (i + 1) % args.log_every == 0:
             step = (epoch - 1) * len(loader) + i
             writer.add_scalar("train/loss_batch", loss.item(), step)
-        pbar.set_postfix(loss=f"{loss.item():.4f}")
 
     avg_loss = total_loss / max(n_batches, 1)
     writer.add_scalar("train/loss_epoch", avg_loss, epoch)
@@ -135,14 +155,12 @@ def train_one_epoch(model, loader, optimizer, criterion, device, writer,
 
 
 @torch.no_grad()
-def validate(model, loader, criterion, metrics: SegmentationMetrics,
-             device, writer, epoch: int):
+def validate(model, loader, criterion, metrics, device, writer, epoch):
     model.eval()
     metrics.reset()
     total_loss = 0.0
     n_batches = 0
-    pbar = tqdm(loader, desc=f"[val]   epoch {epoch}", leave=False, ncols=100)
-    for images, masks in pbar:
+    for images, masks in tqdm(loader, desc=f"[val]   epoch {epoch}", leave=False, ncols=100):
         images = images.to(device, non_blocking=True)
         masks = masks.to(device, non_blocking=True)
         logits = model(images)
@@ -164,13 +182,8 @@ def validate(model, loader, criterion, metrics: SegmentationMetrics,
     return avg_loss, results
 
 
-# ------------------------------------------------------------------ main
-
-
 def main():
     args = parse_args()
-
-    # Reproducibility
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
@@ -178,30 +191,26 @@ def main():
     device = pick_device(args.device)
     print(f"[INFO] Device: {device}")
 
-    # Run directory
     if args.run_name is None:
-        args.run_name = f"unet_{args.encoder}_{time.strftime('%Y%m%d_%H%M%S')}"
+        args.run_name = f"unet_{time.strftime('%Y%m%d_%H%M%S')}"
     run_dir = Path(args.output_dir) / args.run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"[INFO] Run dir: {run_dir}")
-
     with open(run_dir / "config.json", "w") as f:
         json.dump(vars(args), f, indent=2)
 
-    # --- Datasets + loaders ---
-    train_ds = VDDDataset(args.data_root, "train",
-                          transform=get_train_transform(args.image_size))
-    val_ds = VDDDataset(args.data_root, "val",
-                        transform=get_eval_transform(args.image_size))
+    # --- Datasets ---
+    train_transform = get_train_transform(args.image_size)
+    val_transform = get_eval_transform(args.image_size)
 
+    train_roots = args.data_roots if args.data_roots else [args.data_root]
+    print(f"[INFO] Training data roots: {train_roots}")
+    train_ds = build_train_dataset(train_roots, args.image_size, args.subset, train_transform)
+    val_ds = VDDDataset(args.data_root, "val", transform=val_transform)
     if args.subset > 0:
-        k_train = min(args.subset, len(train_ds))
         k_val = min(max(args.subset // 2, 4), len(val_ds))
-        train_ds = Subset(train_ds, list(range(k_train)))
         val_ds = Subset(val_ds, list(range(k_val)))
-        print(f"[INFO] SUBSET MODE: train={len(train_ds)}, val={len(val_ds)}")
-    else:
-        print(f"[INFO] Dataset: train={len(train_ds)}, val={len(val_ds)}")
+    print(f"[INFO] Dataset: train={len(train_ds)}, val={len(val_ds)}")
 
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
@@ -213,34 +222,33 @@ def main():
     )
     print(f"[INFO] Batches: train={len(train_loader)}, val={len(val_loader)}")
 
-    # --- Model, loss, optimizer, scheduler ---
+    # --- Model ---
     model = build_unet(
         num_classes=args.num_classes,
         encoder_name=args.encoder,
         encoder_weights=None if args.no_pretrained else "imagenet",
     ).to(device)
-    _, total_params = count_parameters(model)
-    print(f"[INFO] Model: {args.encoder} U-Net | params: {human_readable(total_params)}")
+    trainable, total = count_parameters(model)
+    print(f"[INFO] Model: {args.encoder} U-Net | params: {human_readable(total)}")
 
-    # Optionally compute per-class weights from the training-set pixel frequencies
+    # --- Loss with optional class weights ---
     if args.class_weights != "none":
-        print(f"[INFO] Computing per-class weights ({args.class_weights}) from train masks ...")
-        # Use the underlying dataset (not the Subset wrapper) for the full-frequency pass
-        base_train_ds = train_ds.dataset if isinstance(train_ds, Subset) else train_ds
-        # Use the dataset's helper that scans all masks; values returned as percent of total
-        dist = base_train_ds.get_class_distribution()
-        # dist is {class_name: frequency_in_[0,1]}
-        # build weight tensor in class-id order (0..num_classes-1)
+        print(f"[INFO] Computing per-class weights ({args.class_weights}) "
+              f"from train masks of FIRST root only ({train_roots[0]}) ...")
+        # Use the first root's distribution (typically the clean one).
+        # For mixed training, the clean dist is a reasonable baseline; we don't
+        # need to scan the foggy variants too because masks are identical.
+        base_ds = VDDDataset(train_roots[0], "train", transform=None)
+        dist = base_ds.get_class_distribution()
         freqs = np.array(
             [dist.get(VDD_CLASSES[i], 1e-9) for i in range(args.num_classes)],
             dtype=np.float64,
         )
-        freqs = np.clip(freqs, 1e-9, None)  # avoid div-by-zero
+        freqs = np.clip(freqs, 1e-9, None)
         if args.class_weights == "inverse":
             weights = 1.0 / freqs
         else:  # inverse_sqrt
             weights = 1.0 / np.sqrt(freqs)
-        # normalize so the mean is ~1 (keeps loss magnitude comparable to unweighted)
         weights = weights / weights.mean()
         print(f"[INFO] Class frequencies (%): "
               + ", ".join(f"{VDD_CLASSES[i]}={freqs[i]*100:.3f}" for i in range(args.num_classes)))
@@ -250,10 +258,12 @@ def main():
         criterion = nn.CrossEntropyLoss(weight=weight_tensor)
     else:
         criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
-                                  weight_decay=args.weight_decay)
+
+    # --- Optimizer / scheduler ---
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
+    # --- Metrics + TB ---
     class_names = [VDD_CLASSES[i] for i in range(args.num_classes)]
     metrics = SegmentationMetrics(args.num_classes, device, class_names)
     writer = SummaryWriter(log_dir=str(run_dir / "tb"))
@@ -266,18 +276,16 @@ def main():
     print(f"\n[INFO] Starting training for {args.epochs} epochs\n")
     for epoch in range(1, args.epochs + 1):
         t0 = time.perf_counter()
-
         train_loss = train_one_epoch(model, train_loader, optimizer, criterion,
                                      device, writer, epoch, args)
         val_loss, val_results = validate(model, val_loader, criterion, metrics,
                                          device, writer, epoch)
         scheduler.step()
-
         dt = time.perf_counter() - t0
+
         miou = val_results["mIoU"]
-        print(f"[epoch {epoch:3d}/{args.epochs}] "
-              f"train_loss={train_loss:.4f}  val_loss={val_loss:.4f}  "
-              f"mIoU={miou:.4f}  F1={val_results['F1']:.4f}  "
+        print(f"[epoch {epoch:3d}/{args.epochs}]  train_loss={train_loss:.4f}  "
+              f"val_loss={val_loss:.4f}  mIoU={miou:.4f}  F1={val_results['F1']:.4f}  "
               f"acc={val_results['accuracy']:.4f}  ({dt:.1f}s)")
 
         history.append({
@@ -289,7 +297,6 @@ def main():
             "val_accuracy": val_results["accuracy"],
             "val_per_class_iou": val_results["per_class_iou"],
             "time_s": dt,
-            "lr": optimizer.param_groups[0]["lr"],
         })
 
         if miou > best_miou:
@@ -299,33 +306,31 @@ def main():
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
-                "mIoU": best_miou,
+                "mIoU": miou,
                 "args": vars(args),
             }, run_dir / "best.pth")
-            print(f"              -> new best mIoU, saved best.pth")
+            print(f"             -> new best mIoU, saved best.pth")
 
-        # Save history every epoch (so if we Ctrl+C we don't lose it)
         with open(run_dir / "history.json", "w") as f:
             json.dump(history, f, indent=2)
 
-    # --- Final save ---
+    # --- Final saves ---
     torch.save({
         "epoch": args.epochs,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
-        "mIoU": val_results["mIoU"],
+        "mIoU": miou,
         "args": vars(args),
     }, run_dir / "last.pth")
     writer.close()
 
     print("\n" + "=" * 60)
-    print(f"TRAINING DONE")
+    print("TRAINING DONE")
     print("=" * 60)
     print(f"Best val mIoU : {best_miou:.4f}  (epoch {best_epoch})")
     print(f"Run dir       : {run_dir}")
     print(f"\nTo inspect training curves in TensorBoard, run:")
     print(f"  tensorboard --logdir {args.output_dir}")
-    print("Then open the URL it prints (usually http://localhost:6006) in your browser.")
 
 
 if __name__ == "__main__":
